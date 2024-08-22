@@ -1,6 +1,8 @@
 from os import makedirs
 from os.path import isfile
 from pathlib import Path
+from time import sleep
+
 import re
 import logging
 import numpy as np
@@ -160,10 +162,13 @@ def _print_dicts(dictionary, max_rows=None, max_col_width=120, selection=None, e
     pd.set_option('display.max_rows', max_rows)
     pd.set_option('display.max_colwidth', max_col_width)
     df = pd.DataFrame.from_dict(sel, orient='index')
+    
+    # Only drop keys that exist
+    exclude_keys = list(set(df.columns) & set(exclude_keys))
     df.drop(exclude_keys, axis=1, inplace=True)
     display(df)
     
-    return True
+    return df
 
 
 def _calc_trimmed_mean(df, columns=[], x_col=None, x_limits=[], percentile=0):
@@ -233,11 +238,9 @@ def _axs_idx_map(idx, num_cols, num_rows, identity=True):
 
 def _parse_template(measurement, template=None, exclude_keys=['data'], additional_labels=None):
     format_dict = {}
-    default_template = ''
-    use_default = False
+  
     if template is None:
         template = ''
-        use_default = True
     elif type(template) is not str:
         logging.warning(f'template needs to be a string. Aborting...')
         return False
@@ -254,22 +257,20 @@ def _parse_template(measurement, template=None, exclude_keys=['data'], additiona
         if k in exclude_keys:
             continue
         
-        default_template = default_template + f'{k}: {v}, '
-        
         r = re.compile(str(k))
         if r.search(template):
-            format_dict[k] = v
-    
-    default_template = default_template[:-2]
-    
-    if use_default:
-        return default_template.format(**format_dict)
-    
-    try:
-        string = template.format(**format_dict)
-    except KeyError:
-        logging.warning(f'Did not find all attributes specified in the template. Defaulting to default template')
-        string = default_template.format(**format_dict)
+            format_dict[k] = v    
+    while True:
+        try:
+            string = template.format(**format_dict)
+            break
+        except KeyError as e:
+            missing_key = e.args[0]
+            logging.warning(f'Did not find the attribute: {missing_key} specified in the template.')
+            format_dict[missing_key] = f'<{missing_key}>'
+            #raise e
+
+        
         
     return string
 
@@ -369,15 +370,81 @@ def _clean_string(string):
 
     return string
 
-def _rename_safepath(dir_path, subfolder_name, name):
+def _rename_safepath(dir_path, subfolder_name, name, filetype='png'):
     num = 2
     while True:
         new_name = name + f'_{num}'
         new_safepath = _generate_safe_path(dir_path, subfolder_name, new_name)
-        if not isfile(str(new_safepath)+'.png'):
+        if not isfile(str(new_safepath)+'.' + filetype):
             break
         num = num+1
     return new_safepath
-    
 
 
+def save_figures(figures, figure_specs, savenames, directory, subdirectory='clean', dpi=300, filetype='png'):
+    for_all_flag = False
+    save_flag = True
+    rename_flag = False
+    for i, (fig, name) in enumerate(zip(figures, savenames)):
+        spec = figure_specs[i]
+
+        # Set name of subfolder (will be generated if it doesn't exist)
+        subfolder_name = subdirectory
+
+        if spec['xscale'] == 'log':
+            name = name + f'_xlog'
+        if spec['yscale'] == 'log':
+            name = name + f'_ylog'
+
+        if spec['xlim'].size:
+            xlim = spec['xlim']
+            name = name + f'_x={xlim[0]:.0E}_to_{xlim[1]:.0E}'
+        if spec['ylim'].size:
+            ylim = spec['ylim']
+            name = name + f'_y={ylim[0]:.0E}_to_{ylim[1]:.0E}'
+
+        safepath = _generate_safe_path(directory, subfolder_name, name)
+        print(safepath)
+        
+        if isfile(str(safepath)+'.'+filetype) and not for_all_flag:
+            print('Should file be overwritten: yes[y] / no [n] / no to all [nn] / yes to all [yy] / rename [r] / rename all [rr]:')
+            sleep(0.5)
+            inp = input()
+            if inp == 'n':
+                print('Not saving...')
+                save_flag = False
+                rename_flag = False
+            elif inp == 'nn':
+                print('Not saving any measurements')
+                save_flag = False
+                rename_flag = False
+                for_all_flag = True
+            elif inp == 'y':
+                save_flag = True
+                rename_flag = False
+            elif inp == 'yy':
+                save_flag = True
+                rename_flag = False
+                for_all_flag = True
+            elif inp == 'r':
+                print('Renaming...')
+                rename_flag = True
+                save_flag = True
+            elif inp == 'rr':
+                print('Renaming all measurements')
+                rename_flag = True
+                save_flag = True
+                for_all_flag = True
+            else:
+                print('Unknown input. Aborting...')
+                save_flag = False
+                rename_flag = False
+
+
+        if rename_flag:
+            safepath = _rename_safepath(directory, subfolder_name, name, filetype=filetype)
+
+        if save_flag:
+            fig.savefig(str(safepath) + '.' + filetype, dpi=dpi, bbox_inches="tight", format=filetype)
+
+        

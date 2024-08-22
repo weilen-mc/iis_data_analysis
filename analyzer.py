@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker
 import fnmatch
 import datetime
+import itertools
 
 import pandas as pd
 
@@ -66,10 +67,12 @@ class Analyzer:
             logging.warning(f"No raw measurement data found")
             return False
 
-    def print_measurements(self, exclude_keys=['data'], **kwargs):
-        if not utils._print_dicts(self.measurements, exclude_keys=exclude_keys, **kwargs):
+    def print_measurements(self, exclude_keys=['data', 'metadata'], **kwargs):
+        df = utils._print_dicts(self.measurements, exclude_keys=exclude_keys, **kwargs)
+        if type(df) is bool:
             logging.warning(f"No measurements loaded.")
             return False
+        return df
 
     def print_metadata_of_selection(self, sel=None, exclude_keys=['data'], display_data=True):
         if not utils._sanity_check_selection(self):
@@ -94,7 +97,7 @@ class Analyzer:
         return metadata_dict
 
     
-    def rm_zero(self, axis='Voltage', thr=1e-4, exclude_patterns='_CH1'):   
+    def rm_outlier(self, axis='Voltage', limits=[], exclude_patterns='_CH1'):
         idces_to_delete = []     
         for idx, m in self.measurements.items():
 
@@ -103,11 +106,41 @@ class Analyzer:
                     #print(f'skipping: {idx}')
                     continue
 
+            data = m['data']
+        
+            if axis in data:
+                #mask = (data[axis] > limits[0]) & (data[axis] < limits[1])
+                mask = data[axis].between(limits[0], limits[1])
+                m['data'] = data[mask]
+            else:
+                m['data'] = data
+                
+
+            try:
+                t_0 = m['data']['Time'].iloc[0]
+            except IndexError:
+                logging.warning(f"No data found after removing zero for idx {idx}. Deleting measurement...")
+                idces_to_delete.append(idx)
+
+        for idx in idces_to_delete:
+            del self.measurements[idx]
+
+        return True
+    
+    def rm_zero(self, axis='Voltage', thr=1e-4, exclude_patterns='_CH1'): 
+        idces_to_delete = []     
+        for idx, m in self.measurements.items():
+
+            if exclude_patterns is not None:
+                if type(idx) is str and utils._contains_patterns(idx, exclude_patterns):
+                    #print(f'skipping: {idx}')
+                    continue
 
             data = m['data']
         
             if axis in data:
-                m['data'] = data[data[axis].abs() > thr]
+                mask = (data[axis].abs() > thr)
+                m['data'] = data[mask]
             else:
                 m['data'] = data
                 
@@ -157,68 +190,35 @@ class Analyzer:
 
         return True
 
-
-    def scale_selection(self, cols, scale_fn, appendix='scaled'):
-        if not utils._sanity_check_selection(self):
-            return False
-
-        scaled_selection = []
+    
+    def scale_selection(self, x_axis, y_axis, limits, set_G=0, calc_mean=True, scale_method='add', appendix='scaled'):
+        selection_scaled = []
         for idx in self.selection:
             m = copy.deepcopy(self.measurements[idx])
-            m['data'][cols] = m['data'][cols].apply(scale_fn(m))
+            try:
+                if calc_mean:
+                    init_G = m['data'][(m['data'][x_axis]>limits[0]) & (m['data'][x_axis]<limits[1])][y_axis].mean()
+                else:
+                    init_G = m['data'][(m['data'][x_axis]>limits[0]) & (m['data'][x_axis]<limits[1])][y_axis].head(1).iloc[0]
+            except IndexError:
+                print(f'Index {idx}: No {x_axis} data found in the interval: {limits}. Continuing...')
+                continue
+                
+            if scale_method == 'add':
+                m['data'][y_axis] = m['data'][y_axis] - init_G + set_G
+            elif scale_method == 'mult':
+                m['data'][y_axis] = m['data'][y_axis]/init_G * set_G
+            else:
+                raise NotImplementedError
             #m['data'] = m['data'].apply(scale_fn)
             new_idx = f'{idx}_{appendix}'
-            scaled_selection.append(new_idx)
+            selection_scaled.append(new_idx)
             self.measurements[new_idx] = m
-
-        return scaled_selection
-
-
-    def _split_selection_on_change(self, col, appendix='split'):
-        split_selection = []
-        for idx in self.selection:
-            m = copy.deepcopy(self.measurements[idx])
-            data = m['data']
-            if col not in data:
-                logging.warning(f"Did not find: {col} for idx> {idx}")
-                continue
-            
-            if 'Time' in data:
-                duration = data['Time'].tail(1).iloc[0] - data['Time'].head(1).iloc[0]
-                start_stamp = m['timestamp'] - datetime.timedelta(seconds=duration)
-            split_idces = data[data[col].diff() != 0].index.tolist()
-            print(split_idces)
-
-            for i, split_idx in enumerate(split_idces[:-1]):
-                m = copy.deepcopy(self.measurements[idx])
-                data = m['data']
-                m['data'] = data.loc[split_idx:split_idces[i+1] - 1]
-                if 'Time' in data:
-                    t_end = m['data']['Time'].tail(1).iloc[0]
-                    m['timestamp'] = start_stamp + datetime.timedelta(seconds=t_end)
-                
-                new_idx = f'{idx}_{appendix}_{i}'
-                split_selection.append(new_idx)
-                self.measurements[new_idx] = m
-                
+        return selection_scaled
 
 
-            else:
-                m = copy.deepcopy(self.measurements[idx])
-                data = m['data']
-                m['data'] = data.loc[split_idces[-1]:]
-                if 'Time' in data:
-                    t_end = m['data']['Time'].tail(1).iloc[0]
-                    m['timestamp'] = start_stamp + datetime.timedelta(seconds=t_end)
 
-                new_idx = f'{idx}_{appendix}_{i+1}'
-                split_selection.append(new_idx)
-                self.measurements[new_idx] = m
-
-        return split_selection
-
-
-    def _split_selection(self, col, split_points, overlap=0, appendix='split', start_value=None, add_labels={}):
+    def split_selection(self, col, split_points, overlap=0, appendix='split', start_value=None, add_labels={}):
         if type(split_points) is not list and type(split_points) is not dict:
             logging.warning(f"split_points must be of type: list or dict.")
             return False
@@ -228,7 +228,7 @@ class Analyzer:
             split_points = {}
             for s in self.selection:
                 split_points[s] = points
-        
+
 
         split_selection = []
         for idx in self.selection:
@@ -242,7 +242,12 @@ class Analyzer:
                     p_previous = split_points[idx][i-1] - overlap
                     m['data'] = data[(data[col]>=p_previous) & (data[col]<p)]
                     m['timestamp'] = m['timestamp'] + datetime.timedelta(seconds=p_previous)
-                    m['V_0'] = round(m['data']['Voltage'].iloc[0], ndigits=1)
+                try:
+                    m['V_start'] = np.round(m['data']['Voltage'].iloc[1], decimals=1)
+                    m['V_end'] = np.round(m['data']['Voltage'].iloc[-1], decimals=1)
+                except:
+                    m['V_start'] = None
+                    m['V_end'] = None
 
                 for k,v in add_labels.items():
                     try:
@@ -260,7 +265,12 @@ class Analyzer:
                 data = m['data']
                 m['data'] = data[(data[col]>=p-overlap)]
                 m['timestamp'] = m['timestamp'] + datetime.timedelta(seconds=p-overlap)
-                m['V_0'] = round(m['data']['Voltage'].iloc[0], ndigits=1)
+                try:
+                    m['V_start'] = np.round(m['data']['Voltage'].iloc[1], decimals=1)
+                    m['V_end'] = np.round(m['data']['Voltage'].iloc[-1], decimals=1)
+                except:
+                    m['V_start'] = None
+                    m['V_end'] = None
 
                 for k,v in add_labels.items():
                     try:
@@ -275,17 +285,6 @@ class Analyzer:
                     self.measurements[new_idx] = self.set_start_time_to_value(new_idx, value=start_value)
 
         return split_selection
-
-
-    def split_selection(self, col, split_points, overlap=0, appendix='split', start_value=None, add_labels={}, split_on_change=False):
-        if not utils._sanity_check_selection(self):
-            return False
-
-        if split_on_change:
-            return self._split_selection_on_change(col, appendix=appendix)
-        else:
-            return self._split_selection(col, split_points, overlap=overlap, appendix=appendix, start_value=start_value, add_labels=add_labels)
-
         
 
 
@@ -417,7 +416,16 @@ class Analyzer:
 
         return [result_name]
         
-
+    def moving_avg(self, axes, window=3, appendix='m_avg'):
+        selection_mavg = []
+        for idx in self.selection:
+            m = copy.deepcopy(self.measurements[idx])
+            data = m['data']
+            m['data'][axes] = data[axes].rolling(window).mean()
+            new_idx = f'{idx}_{appendix}'
+            selection_mavg.append(new_idx)
+            self.measurements[new_idx] = m
+        return selection_mavg
 
 
     def concat_selection_in_time(self, meta_idx=0, start_time=None, no_gap=False, appendix='shifted', result_name='concat'):
@@ -635,7 +643,7 @@ class Analyzer:
         return True
 
 
-    def create_point_measurement(self, axis, limits, attr_selection=[], meta_idx=0, id_attr=None, add_columns={}, x_fit_col=None, y_fit_col=None, appendix='pick', result_name='points', **kwargs):
+    def create_point_measurement(self, axis, limits, attr_selection=[], meta_idx=0, id_attr=None, add_columns={}, x_fit_col=None, y_fit_col=None, appendix='pick', all_points=False, result_name='points', **kwargs):
         if not utils._sanity_check_selection(self):
             return False
 
@@ -646,7 +654,7 @@ class Analyzer:
         for i, idx in enumerate(self.selection):   
             m = self.measurements[idx]
             point_measurement = copy.deepcopy(m)
-            if i==meta_idx:
+            if all_points and i==meta_idx:
                 all_point_measurement = copy.deepcopy(m)
             data = m['data']
             if type(limits) is list and type(limits[0]) is list:
@@ -676,9 +684,11 @@ class Analyzer:
             point_measurement['data'] = sel_data
             self.measurements[new_idx] = point_measurement
             picked_selection.append(new_idx)
-            points = points.append(sel_data, ignore_index = True)
+            
+            if all_points:
+                points = points.append(sel_data, ignore_index = True)
 
-        if add_columns:
+        if all_points and add_columns:
             if id_attr is None:
                 points = utils._add_data_cols(points, add_columns, merge_on=None)
             elif id_attr in points:
@@ -686,11 +696,11 @@ class Analyzer:
             else:
                 logging.warning(f'ID attribute: {id_attr} not found. No columns added...')
         
+        if all_points:
+            all_point_measurement['data'] = points
+            self.measurements[result_name] = all_point_measurement
         
-        all_point_measurement['data'] = points
-        self.measurements[result_name] = all_point_measurement
-        
-        if x_fit_col is not None and y_fit_col is not None:
+        if all_points and x_fit_col is not None and y_fit_col is not None:
             if x_fit_col in points and y_fit_col in points: 
                 x = points[x_fit_col]
                 y = points[y_fit_col]
@@ -710,48 +720,119 @@ class Analyzer:
         return picked_selection
 
 
-    def calc_stdp(self, limits_before, limits_after, delta_t, result_name='stdp'):
-        if not utils._sanity_check_selection(self):
-            return False
+    
+    def _consecutive_rows_exceed_threshold(self, df, column, threshold, n, up_thr = None):
+        """
+        Returns a mask indicating the indices where n consecutive rows exceed the threshold in a specific column.
 
-        if type(limits_before) is not list or type(limits_after) is not list:
-            logging.warning(f'limits need to be of type: list. Aborting...')
-            return False
+        Parameters:
+        - df: pandas DataFrame
+        - column: str, name of the column to check
+        - threshold: int or float, threshold value
+        - n: int, number of consecutive rows
 
-        if type(delta_t) is not list:
-            logging.warning(f'delta_t needs to be of type: list. Aborting...')
-            return False
+        Returns:
+        - numpy array, a boolean mask where True indicates the indices where the condition is met
+        """
+        if threshold < 0:
+            exceed_count = df[column] < threshold
+        else:
+            exceed_count = df[column] > threshold
+        if up_thr is not None:
+            if up_thr < 0:
+                exceed_count = exceed_count > up_thr
+            else:
+                exceed_count = exceed_count < up_thr
+        exceed_count = exceed_count.astype(int)
+        exceed_count = exceed_count.rolling(n).sum() >= n
+        exceed_count = exceed_count.fillna(False).astype(bool)
 
-        if type(limits_before[0]) is list and len(limits_before) != len(self.selection):
-            logging.warning(f'limits_before needs to be same length as selection. Aborting...')
-            return False
+        transitions = np.diff(np.concatenate(([0], exceed_count.astype(int), [0])))
+        start_indices = np.where(transitions == 1)[0]
 
-        if type(limits_after[0]) is list and len(limits_after) != len(self.selection):
-            logging.warning(f'limits_after needs to be same length as selection. Aborting...')
-            return False
+        # Prepend 'n' ones to each segment
+        for idx in start_indices:
+            exceed_count[max(0, idx - n + 1):idx + 1] = True
 
-        if len(delta_t) != len(self.selection):
-            logging.warning(f'delta_t needs to be same length as selection. Aborting...')
-            return False
-        
+        return exceed_count
+    
+    
+    
+    def pick_points_trigger(self, trigger_level, axis='Voltage', n_points_per_pulse=5, n_points_before_pulse_end=5, fill_above_trigger_level_points=None, fill_above_up_thr=None, appendix='trig', active_edge='falling'):
+        picked_selection = []
+        copy_excl_keys = ['data']
+        for idx in self.selection:
+            m = self.measurements[idx]
+            point_measurement = {k: v for k, v in m.items() if k not in copy_excl_keys}
+            #point_measurement = copy.deepcopy(m)
+            data = m['data'].reset_index(drop=True)
+            #self.measurements[idx]['data'] = data
+            if active_edge == 'rising':
+                if trigger_level < 0:
+                    mask = (data[axis].shift(-1, fill_value=0) <= trigger_level) & (data[axis] > trigger_level)
+                else:
+                    mask = (data[axis].shift(-1, fill_value=0) >= trigger_level) & (data[axis] < trigger_level)
+            else:
+                if trigger_level <0:
+                    mask = (data[axis].shift(-1, fill_value=0) >= trigger_level) & (data[axis] < trigger_level)
+                else:
+                    mask = (data[axis].shift(-1, fill_value=0) <= trigger_level) & (data[axis] > trigger_level)
+                             
+                
+            end_points = data[mask]
+            end_point_idces = end_points.index - n_points_before_pulse_end
+            selected_point_idces = end_point_idces[end_point_idces >= 0]
+            for i in range(1,n_points_per_pulse):
+                #print(selected_point_idx[0:10])
+                selected_point_idces = selected_point_idces.union(end_point_idces-i)
+            
+            if fill_above_trigger_level_points is not None:
+                mask_above_trigger_level = self._consecutive_rows_exceed_threshold(data, axis, trigger_level, fill_above_trigger_level_points, up_thr=fill_above_up_thr)
+                points_above_trigger_level = data[mask_above_trigger_level].index
+                
+                selected_point_idces = selected_point_idces.union(points_above_trigger_level)
+                #mask = mask | mask_above_trigger_level
+            
+            selected_points = data.loc[selected_point_idces]
+            
+            new_idx = f'{idx}_{appendix}'
+            point_measurement['data'] = selected_points
+            self.measurements[new_idx] = point_measurement
+            picked_selection.append(new_idx)
+            
+        return picked_selection
 
-        self.add_attributes_to_selection({'dt': delta_t})
-        self.create_point_measurement('Time', limits_before, attr_selection=['dt'],
-                                    nr_of_rows=1, aggr_fn='mean', result_name=f'{result_name}_before')
+
+    def pick_timestamps_trigger(self, axis, trigger_level, timestamp_axis='Time', timestamp_offset=0, n_points_before_pulse_end=0, n_points_per_pulse=1, active_edge='falling'):
+        picked_timestamps = {}
+        for idx in self.selection:
+            m = self.measurements[idx]
+            #point_measurement = copy.deepcopy(m)
+            data = m['data']
+            mask_rising = (data[axis].shift(-1, fill_value=0) >= trigger_level) & (data[axis] < trigger_level)
+            mask_falling = (data[axis].shift(-1, fill_value=0) <= trigger_level) & (data[axis] > trigger_level)
+            if active_edge == 'rising':
+                mask = mask_rising
+            elif active_edge == 'falling':
+                mask = mask_falling
+            else:
+                mask = mask_rising | mask_falling
+            end_points = data[mask]
+            end_point_idces = end_points.index - n_points_before_pulse_end
+            selected_point_idces = end_point_idces
+            iter_start = 1*np.sign(n_points_per_pulse)
+            for i in range(iter_start,n_points_per_pulse):
+                selected_point_idces = selected_point_idces.union(end_point_idces-i)
+
+            picked_timestamps[idx] = list(data[timestamp_axis].loc[selected_point_idces] + timestamp_offset)
+
+        return picked_timestamps
+          
 
 
-        self.create_point_measurement('Time', limits_after, attr_selection=['dt'],
-                                    nr_of_rows=1, aggr_fn='mean', result_name=f'{result_name}_after')
-
-        data_before = self.measurements[f'{result_name}_before']['data']
-        data_after = self.measurements[f'{result_name}_after']['data']
-        self.measurements[result_name] = copy.deepcopy(self.measurements[f'{result_name}_before'])
-        self.measurements[result_name]['data'] = (data_after-data_before)/data_before*100
-        self.measurements[result_name]['data']['dt'] = data_before['dt']
-        
-    def fit_selection(self, model, x_axis, y_axis, limits, appendix='fit', manual_parameters={}, **curve_fit_kwargs):
+    def fit_selection(self, model, x_axis, y_axis, limits, fit_x=None, selection_stds=[], appendix='fit', manual_parameters={}, scale_factor=1, fix_first_point=False, **curve_fit_kwargs):
         fitted_selection = []
-        for i, idx in enumerate(self.selection):
+        for i, (idx, idx_err) in enumerate(itertools.zip_longest(self.selection, selection_stds)):
             m = copy.deepcopy(self.measurements[idx])
             data = m['data']
 
@@ -760,11 +841,23 @@ class Analyzer:
             else:
                 lims = limits
             sel_data = data[(data[x_axis]>=lims[0]) & (data[x_axis]<=lims[1])]
-            x = sel_data[x_axis]
-            
+
+            x = sel_data[x_axis]             
+
+            if idx_err is not None:
+                err_data = self.measurements[idx_err]['data']
+                err_data = err_data[(data[x_axis]>=lims[0]) & (data[x_axis]<=lims[1])]            
+
             if type(y_axis) is not list:
                 y_axis = [y_axis]
-                
+
+            if fit_x is None:
+                fit_x = x
+
+
+            data_result = pd.DataFrame()
+            data_result[x_axis] = pd.Series(fit_x)
+
             for y_ax in y_axis:
                 print_str = f'Parameters for axis: {y_ax}'
                 if idx in manual_parameters:
@@ -773,23 +866,78 @@ class Analyzer:
                     covariance = ''
                 else:
                     y = sel_data[y_ax]
-                    parameters, covariance = curve_fit(model, x, y, **curve_fit_kwargs)
-                fit_y = model(x, *parameters)
-                data[y_ax] = pd.Series(fit_y)
+                    if idx_err is not None:
+                        sigma = err_data[y_ax]
+                    else:
+                        sigma = None
+
+                    # if fix_first_point:
+                    #     if 'bounds' in curve_fit_kwargs:
+                    #         bounds = curve_fit_kwargs['bounds']
+                    #     else:
+                    #         bounds = ([], [])
+
+                    parameters, covariance = curve_fit(model, x, y*scale_factor, sigma=sigma, **curve_fit_kwargs)
+
+                fit_y = model(fit_x, *parameters)
+
+
+                data_result[y_ax] = pd.Series(fit_y)/scale_factor
                 print(print_str)
                 for i, p in enumerate(parameters):
                     par_name = f'p{i}_{y_ax}'
                     print(f'{par_name} = {p}')
                     m[par_name] = p
-                print('Covariance:')
-                print(covariance)
-                print()
+                # print('Covariance:')
+                # print(covariance)
+                # print()
 
             new_idx = f'{idx}_{appendix}'
             fitted_selection.append(new_idx)
+            data_result.reset_index(drop=True, inplace=True)
+            m['data'] = data_result
             self.measurements[new_idx] = m
 
         return fitted_selection
+
+
+
+    def calc_errorbars(self, selection_err):
+        selection_means = []
+        selection_stds = []
+        for same_measurement_ids in selection_err:
+            same_measurement_data = [self.measurements[idx]['data'].reset_index(drop=True) for idx in same_measurement_ids]
+            aggr_data = pd.concat(same_measurement_data)
+            #display(aggr_data.head())
+            by_row_index = aggr_data.groupby(aggr_data.index)
+            data_means = by_row_index.mean()
+            m = copy.deepcopy(self.measurements[same_measurement_ids[0]])
+            m['data'] = data_means
+            new_idx = ''
+
+            for i, idx in enumerate(same_measurement_ids):
+                if i != (len(same_measurement_ids)-1) and type(idx) is str:
+                    idx = idx.split('_')[0]
+                new_idx = new_idx + f'{idx}_'
+            new_idx = new_idx + 'mean'
+            selection_means.append(new_idx)
+            self.measurements[new_idx] = m
+
+            data_std = by_row_index.std()
+            copy_excl_keys = ['data']
+            m = {k: v for k, v in self.measurements[same_measurement_ids[0]].items() if k not in copy_excl_keys}
+            m['data'] = data_std
+            new_idx = ''
+            for i, idx in enumerate(same_measurement_ids):
+                if i != (len(same_measurement_ids)-1) and type(idx) is str:
+                    idx = idx.split('_')[0]
+                new_idx = new_idx + f'{idx}_'
+            new_idx = new_idx + 'std'
+            selection_stds.append(new_idx)
+            self.measurements[new_idx] = m
+            
+        return selection_means, selection_stds
+
 
                 
     def generate_plot(self, x_data, y_data, ax, title=None, xlabel=None, ylabel=None,
@@ -852,7 +1000,7 @@ class Analyzer:
         
 
 
-    def generate_measurement_plot(self, idx, ax, meas_type='IV', title_template=None, legend_template=None, x_scale_fn=None, y_scale_fn=None, add_labels={}, run_selection=[], **kwargs):
+    def generate_measurement_plot(self, idx, ax, meas_type='IV', title_template=None, legend_template=None, x_scale_fn=None, y_scale_fn=None, add_labels={}, run_selection=[], interleave=1, **kwargs):
 
         if meas_type not in self.meas_type_dict:
             logging.warning(f"Unknown measurement type. Add type to meas_type_dict")
@@ -908,9 +1056,9 @@ class Analyzer:
             if x_axis not in data or y_a not in data:
                 logging.warning(f"Did not find x_axis: {x_axis} or y_axis: {y_a} for index {idx}. Continuing...")
                 continue
-            xy_data = data[[x_axis, y_a]]
-            x_data = data[x_axis] 
-            y_data = data[y_a]
+            xy_data = data[[x_axis, y_a]][::interleave]
+            x_data = data[x_axis][::interleave] 
+            y_data = data[y_a][::interleave]
 
             if x_scale_fn is not None:
                 if callable(x_scale_fn):

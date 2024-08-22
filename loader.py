@@ -1,6 +1,7 @@
 import copy
 import json
 import pandas as pd
+import h5py
 from os import listdir, rename
 from os.path import isfile
 from pathlib import Path
@@ -41,6 +42,9 @@ def _parse_json(dir_path, file):
         try:
             raw_data = _fix_json_keys(raw_data, {'SMU ':'SMU'})
             data = raw_data['data']['SMU']
+            # display(data.keys())
+            # for k in data:
+            #     print(f'len({k}): {len(data[k])}')
             if type(data['Voltage']) is float or type(data['Voltage']) is int:
                 return pd.DataFrame(data, index=[0])
 
@@ -56,16 +60,55 @@ def _parse_json(dir_path, file):
             res = _parse_json_optolab_control(raw_data)
         
 
-        return res
+    return res
     
 def _parse_json_optolab_control(data):
     translation_dict = {'V_ch1': 'Voltage', 'I': 'Current', 'R': 'Resistance', 'time_ch2': 'Time'}
-
+    
     clean_data = {}
     for k,v in translation_dict.items():
         clean_data[v] = data[k]
     res = pd.DataFrame(clean_data)
+    if 'custom_metadata' in data:
+        res.attrs = data['custom_metadata']
     
+    return res
+
+
+def _parse_h5(dir_path, file, exclude_metadata_keys = ['results']):
+    path = dir_path / Path(file)
+    translation_dict = {'V_ch1': 'Voltage', 'I': 'Current', 'R': 'Resistance', 'time': 'Time'}
+    data = pd.read_hdf(path, key='results')
+    data = data.rename(columns=translation_dict)
+#     display(data.keys())
+#     for k in data:
+#         print(f'len({k}): {len(data[k])}')
+    res = data
+    
+    def hdf5_to_dict(hdf5_file, exclude_keys=None):
+        if exclude_keys is None:
+            exclude_keys = []
+
+        def _recursive_dict(group):
+            result = {}
+            for key, item in group.items():
+                if key not in exclude_keys:
+                    if isinstance(item, h5py.Group):
+                        result[key] = _recursive_dict(item)
+                    elif isinstance(item, h5py.Dataset):
+                        try:
+                            result[key] = item[()]
+                        except Exception as e:
+                            pass
+                            # print(f'unable to load: {key}')
+                            # print(e)
+            return result
+
+        with h5py.File(hdf5_file, 'r') as f:
+            return _recursive_dict(f)
+        
+    res.attrs = hdf5_to_dict(path, exclude_keys=exclude_metadata_keys)
+            
     return res
 
 
@@ -138,8 +181,8 @@ class Loader:
         self.loaded_filenames = []
         self.raw_measurements = {}
         self.dir_path = Path()
-        self.accepted_filetypes = ['.json', '.csv', '.txt']
-        self.parsers = [_parse_json, _parse_csv, _parse_zahner]
+        self.accepted_filetypes = ['.json', '.csv', '.txt', '.h5']
+        self.parsers = [_parse_json, _parse_csv, _parse_zahner, _parse_h5]
 
 
     def load_files(self, dir_path, must_contain=None, attr_pattern_specs=None, escape=True, choose_pattern_nr=0, sort=None):
@@ -175,9 +218,11 @@ class Loader:
         
     
     def print_files(self, **kwargs):
-        if not utils._print_dicts(self.files, **kwargs):
+        df = utils._print_dicts(self.files, **kwargs)
+        if type(df) is bool:
             logging.warning(f"No files loaded. Execute load_files() first.")
             return False
+        return df
         
 
     def rename_files(self, rename_selection):
@@ -226,7 +271,6 @@ class Loader:
             logging.warning(f"A parser needs to be registered for every accepted filetype")
             return False
           
-        loaded_filenames = []
         for idx, file in self.files.items():
             if file['filename'] not in self.loaded_filenames:
                 if idx in self.raw_measurements:
@@ -256,7 +300,7 @@ class Loader:
                     except Exception as e:
                         logging.warning(f"File: {filename} could not be parsed.")
                         del self.raw_measurements[idx]
-                        return False
+                        raise e
                     break
                     
         else:
@@ -271,5 +315,9 @@ class Loader:
             self.raw_measurements[idx]['data'] = raw_data['CH2']
             self.raw_measurements[new_idx]['data'] = raw_data['CH1']
         else:
+            if raw_data.attrs:
+                self.raw_measurements[idx]['metadata'] = copy.deepcopy(raw_data.attrs)
+                raw_data.attrs = {}
             self.raw_measurements[idx]['data'] = raw_data
+
         return True
