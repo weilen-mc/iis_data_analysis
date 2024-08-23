@@ -54,4 +54,7 @@ Thumbs.db
 # Py Cache
 __pycache__/
 
+# out files
+*.out
+
 
